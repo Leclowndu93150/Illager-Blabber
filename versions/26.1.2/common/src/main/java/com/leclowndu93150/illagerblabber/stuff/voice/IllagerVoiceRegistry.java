@@ -1,0 +1,185 @@
+package com.leclowndu93150.illagerblabber.stuff.voice;
+
+import net.minecraft.world.entity.monster.illager.AbstractIllager;
+import net.minecraft.world.entity.monster.illager.Evoker;
+import net.minecraft.world.entity.monster.illager.Pillager;
+import net.minecraft.world.entity.monster.illager.Vindicator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Random;
+
+public class IllagerVoiceRegistry {
+    private static final Logger LOGGER = LoggerFactory.getLogger("illagerblabber");
+
+    private static final ConcurrentHashMap<IllagerType, Long> lastGroupSpottedSoundTime = new ConcurrentHashMap<>();
+
+    private static final ConcurrentHashMap<UUID, IllagerVoiceManager> voiceManagers = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, Boolean> hadTargetLastTick = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, Integer> victoryTimers = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, Integer> combatDebounceTimers = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, Long> lastProcessedTick = new ConcurrentHashMap<>();
+    private static long currentGameTick = 0;
+
+    private static final Random safeRandom = new Random();
+
+    private static final ConcurrentHashMap<UUID, UUID> lastPillagerTargets = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, UUID> lastVindicatorTargets = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, UUID> lastEvokerTargets = new ConcurrentHashMap<>();
+
+    public static long getLastGroupSpottedTime(IllagerType type) {
+        return lastGroupSpottedSoundTime.getOrDefault(type, 0L);
+    }
+
+    public static void setLastGroupSpottedTime(IllagerType type, long time) {
+        lastGroupSpottedSoundTime.put(type, time);
+    }
+
+    public static IllagerVoiceManager getVoiceManager(AbstractIllager illager, IllagerType type) {
+        return voiceManagers.computeIfAbsent(illager.getUUID(), uuid -> {
+            LOGGER.info("CREATING NEW VOICE MANAGER FOR {}!", type.name());
+            return new IllagerVoiceManager(illager, type);
+        });
+    }
+
+    private static IllagerType getIllagerType(AbstractIllager illager) {
+        if (illager instanceof Evoker) {
+            return IllagerType.EVOKER;
+        } else if (illager instanceof Vindicator) {
+            return IllagerType.VINDICATOR;
+        } else if (illager instanceof Pillager) {
+            return IllagerType.PILLAGER;
+        } else {
+            return IllagerType.EVOKER;
+        }
+    }
+
+    public static void setHurtState(AbstractIllager entity) {
+        UUID id = entity.getUUID();
+        IllagerVoiceManager voiceManager = voiceManagers.get(id);
+        if (voiceManager == null) return;
+        voiceManager.setState(IllagerState.Hurt.INSTANCE);
+    }
+
+    public static void setVictoryState(AbstractIllager entity) {
+        UUID id = entity.getUUID();
+        IllagerVoiceManager voiceManager = voiceManagers.get(id);
+        if (voiceManager == null) return;
+        voiceManager.setState(IllagerState.Victory.INSTANCE);
+        victoryTimers.put(id, 100);
+    }
+
+    public static void updateIllager(AbstractIllager illager, IllagerType illagerType) {
+        UUID id = illager.getUUID();
+        currentGameTick++;
+
+        if (lastProcessedTick.getOrDefault(id, 0L) == currentGameTick) {
+            LOGGER.info("Entity {} already processed this tick, skipping", id);
+            return;
+        }
+
+        lastProcessedTick.put(id, currentGameTick);
+
+        synchronized (id.toString().intern()) {
+            IllagerVoiceManager voiceManager = getVoiceManager(illager, illagerType);
+            voiceManager.update();
+            updateIllagerState(illager);
+        }
+    }
+
+    private static void updateIllagerState(AbstractIllager illager) {
+        UUID id = illager.getUUID();
+        IllagerType illagerType = getIllagerType(illager);
+        IllagerVoiceManager voiceManager = voiceManagers.get(id);
+        if (voiceManager == null) return;
+
+        boolean hadTarget = hadTargetLastTick.getOrDefault(id, false);
+        int victoryTimer = victoryTimers.getOrDefault(id, 0);
+        int combatDebounceTimer = combatDebounceTimers.getOrDefault(id, 0);
+
+        if (victoryTimer > 0) {
+            victoryTimer--;
+            victoryTimers.put(id, victoryTimer);
+            return;
+        }
+
+        if (combatDebounceTimer > 0) {
+            combatDebounceTimer--;
+            combatDebounceTimers.put(id, combatDebounceTimer);
+        }
+
+        boolean hasTarget = illager.getTarget() != null && illager.getTarget().isAlive();
+
+        if (illagerType == IllagerType.VINDICATOR) {
+            UUID vindicatorId = illager.getUUID();
+
+            if (hasTarget) {
+                lastVindicatorTargets.put(vindicatorId, illager.getTarget().getUUID());
+            } else if (hadTarget && lastVindicatorTargets.containsKey(vindicatorId)) {
+                LOGGER.info("FORCING VINDICATOR VICTORY!");
+                voiceManager.setState(IllagerState.Victory.INSTANCE);
+                victoryTimers.put(id, 60);
+                hadTargetLastTick.put(id, false);
+                lastVindicatorTargets.remove(vindicatorId);
+                return;
+            }
+        }
+
+        if (illagerType == IllagerType.PILLAGER) {
+            UUID pillagerId = illager.getUUID();
+
+            if (hasTarget) {
+                lastPillagerTargets.putIfAbsent(pillagerId, illager.getTarget().getUUID());
+            } else if (hadTarget && lastPillagerTargets.containsKey(pillagerId)) {
+                voiceManager.setState(IllagerState.Victory.INSTANCE);
+                victoryTimers.put(id, 60);
+                hadTargetLastTick.put(id, false);
+                lastPillagerTargets.remove(pillagerId);
+                return;
+            }
+        }
+
+        if (illagerType == IllagerType.EVOKER) {
+            UUID evokerId = illager.getUUID();
+
+            if (hasTarget) {
+                lastEvokerTargets.putIfAbsent(evokerId, illager.getTarget().getUUID());
+            } else if (hadTarget && lastEvokerTargets.containsKey(evokerId)) {
+                voiceManager.setState(IllagerState.Victory.INSTANCE);
+                victoryTimers.put(id, 60);
+                hadTargetLastTick.put(id, false);
+                lastEvokerTargets.remove(evokerId);
+                return;
+            }
+        }
+
+        if (hasTarget) {
+            if (!hadTarget) {
+                voiceManager.setState(IllagerState.Spotted.INSTANCE);
+                hadTargetLastTick.put(id, true);
+            } else {
+                voiceManager.setState(IllagerState.Combat.INSTANCE);
+            }
+
+            combatDebounceTimer = 60 + safeRandom.nextInt(41);
+            combatDebounceTimers.put(id, combatDebounceTimer);
+        } else {
+            if (hadTarget) {
+                if (combatDebounceTimer <= 0) {
+                    voiceManager.setState(IllagerState.Victory.INSTANCE);
+                    victoryTimer = 100;
+                    victoryTimers.put(id, victoryTimer);
+                    hadTargetLastTick.put(id, false);
+                } else {
+                    voiceManager.setState(IllagerState.Combat.INSTANCE);
+                }
+            } else {
+                voiceManager.setState(IllagerState.Passive.INSTANCE);
+            }
+        }
+
+        hadTargetLastTick.put(id, hasTarget);
+    }
+}
